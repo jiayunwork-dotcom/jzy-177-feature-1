@@ -1,0 +1,17 @@
+services:
+  doa-backend:
+    build: .
+    image: ula-music-backend:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      # 会话配置 / 增量状态 / 结果持久化到宿主机
+      - doa-data:/data
+    environment:
+      DOA_DATA_DIR: /data
+      DOA_WINDOW_SIZE: "500"
+      DOA_FORGETTING_FACTOR: "0.98"
+    restart: unless-stopped
+
+volumes:
+  doa-data:

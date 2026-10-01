@@ -1,0 +1,37 @@
+{
+  "scenario": {
+    "snr_db": 15.0,
+    "step": [
+      -30.0,
+      12.0
+    ],
+    "step_at_snapshot": 1200,
+    "seed": 2026,
+    "criterion": "估计进入新方向 ±0.5° 走廊且连续 20 拍不离开",
+    "elements_m": 8,
+    "spacing_over_wavelength": 0.5,
+    "steady_state_window": "阶跃 600 拍之后的全部估计点"
+  },
+  "results": [
+    {
+      "method": "sliding W=100",
+      "track_snapshots_to_0p5_deg": 48,
+      "steady_state_rmse_deg": 0.0254
+    },
+    {
+      "method": "sliding W=300",
+      "track_snapshots_to_0p5_deg": 148,
+      "steady_state_rmse_deg": 0.0087
+    },
+    {
+      "method": "forgetting λ=0.95 (τ≈20)",
+      "track_snapshots_to_0p5_deg": 15,
+      "steady_state_rmse_deg": 0.0486
+    },
+    {
+      "method": "forgetting λ=0.98 (τ≈50)",
+      "track_snapshots_to_0p5_deg": 35,
+      "steady_state_rmse_deg": 0.0254
+    }
+  ]
+}
