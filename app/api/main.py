@@ -152,6 +152,45 @@ def latest_result(session_id: str):
     return {"session_id": session_id, "result": result}
 
 
+# ----------------------------------------------------------------------
+# 航迹
+# ----------------------------------------------------------------------
+@app.get("/sessions/{session_id}/tracks")
+def list_tracks(session_id: str, include_terminated: bool = True):
+    """列出会话的全部航迹（默认含已终止；编号、当前状态、最新角度）。"""
+    session = manager.get(session_id)
+    return {
+        "session_id": session_id,
+        "tracking_enabled": session.tracking_enabled,
+        "tracks": session.list_tracks(include_terminated=include_terminated),
+    }
+
+
+@app.get("/sessions/{session_id}/tracks/{track_id}")
+def get_track(session_id: str, track_id: int):
+    """取单条航迹：当前状态 + 一路走过的历史点（实测 / 交叉外推分别标注）。"""
+    session = manager.get(session_id)
+    track = session.get_track_history(track_id)
+    return {"session_id": session_id, "track": track}
+
+
+@app.get("/sessions/{session_id}/track-events")
+def poll_track_events(session_id: str, since_version: int = 0):
+    """带版本号轮询航迹变化：只返回严格新于 ``since_version`` 的事件批次。
+
+    每个产生过事件的估计版本一行，不漏不重；时间戳仅为展示，不作为
+    重启一致性比较项。
+    """
+    session = manager.get(session_id)
+    rows = session.track_events_since(since_version)
+    return {
+        "session_id": session_id,
+        "since_version": since_version,
+        "latest_version": session.status()["version"],
+        "track_events": rows,
+    }
+
+
 @app.get("/sessions/{session_id}/stream")
 async def stream_results(session_id: str, after_version: int = 0,
                          max_idle_seconds: float = 0.0):

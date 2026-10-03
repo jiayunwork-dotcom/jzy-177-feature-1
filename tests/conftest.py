@@ -59,6 +59,35 @@ def create_session_config(m=8, spacing=0.5, wavelength=1.0, **est_overrides):
     }
 
 
+def tracking_session_config(window_size=50, angle_step=0.5, tracking_overrides=None):
+    """验收航迹剧本的统一会话配置：8 阵元半波长、每批 50、滑动窗口取 50。"""
+    tracking = {"enabled": True}
+    if tracking_overrides:
+        tracking.update(tracking_overrides)
+    return {
+        "array": {"elements": 8, "spacing": 0.5, "wavelength": 1.0},
+        "estimation": {
+            "angle_min": -90.0, "angle_max": 90.0, "angle_step": angle_step,
+        },
+        "update": {"mode": "sliding", "window_size": window_size},
+        "tracking": tracking,
+    }
+
+
+def synthetic_batch(m, angles, powers, snr_db, seed, k=50,
+                    spacing=0.5, wavelength=1.0):
+    """造一批 K=50 快拍并返回 (real, imag)。同种子逐位一致。"""
+    spec = ArraySpec(
+        elements=m, spacing=spacing, wavelength=wavelength,
+    )
+    syn = generate_snapshots(
+        m=m, k=k, angles_deg=list(angles), powers=list(powers),
+        snr_db=snr_db, positions=spec.positions(), wavelength=wavelength,
+        seed=seed,
+    )
+    return np.real(syn["data"]), np.imag(syn["data"])
+
+
 def chunks(x: np.ndarray, sizes):
     idx = 0
     for s in sizes:

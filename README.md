@@ -28,12 +28,15 @@ app/
     engine.py               # 总装 + 全部输入校验 + 规模上限
   sessions/                 # —— 会话存储与增量状态 ——
     accumulator.py          # 滑动窗口 / 指数遗忘 增量协方差 + 批处理参考定义
-    store.py                # 原子落盘（config/state/results.jsonl/batches/buffer.npz）
+    tracker.py              # 角度航迹：GNN 关联、生命周期、交叉护航（纯状态机）
+    store.py                # 原子落盘（config/state/results.jsonl/batches/buffer.npz/tracks.jsonl）
     events.py               # 内存发布订阅（SSE 推送总线）
-    session.py              # 会话：并发锁、批次幂等、追加/估计/持久化/重启续写
+    session.py              # 会话：并发锁、批次幂等、追加/估计/航迹/持久化/重启续写
   api/
     schemas.py              # Pydantic 请求/响应模型
     main.py                 # FastAPI：路由、SSE、错误处理、合成端点
+docs/
+  航迹跟踪设计.md            # 航迹方案取舍：交叉护航为何选它、代价、何时会认错
 experiments/
   tracking_experiment.py    # 滑动窗口 vs 遗忘因子 阶跃跟踪实验
   results/                  # 实验输出（文档取舍数据）
@@ -75,6 +78,8 @@ pytest
 | `POST /sessions/{id}/estimate` | 用当前累计协方差出一次估计（可临时覆盖角度范围/步长/平滑/源数/真值角） |
 | `GET  /sessions/{id}/results?since_version=N` | **带版本号轮询**：只返回严格新于 N 的结果 |
 | `GET  /sessions/{id}/results/latest` | 最新一条 |
+| `GET  /sessions/{id}/tracks` / `…/tracks/{tid}` | 列全部航迹 / 取单条航迹历史（实测点、交叉外推点分别标注） |
+| `GET  /sessions/{id}/track-events?since_version=N` | **航迹生命周期事件版本号轮询**（新出现/确认/丢失/重捕/终止） |
 | `GET  /sessions/{id}/stream?after_version=N` | **SSE 订阅推送**：先补发历史，再推新结果 |
 | `POST /synthesis` | 闭环自测：给各源方位/功率、SNR、快拍数、种子，造数据（可选立即估计/回传数据） |
 
@@ -203,9 +208,11 @@ python -m experiments.tracking_experiment --snr 15 --k-per-side 1200
 
 * **持久化布局**（`DOA_DATA_DIR/<session_id>/`）：
   `config.json`（配置，创建后只读）、`state.json`（累加器元数据+
-  最新结果+版本号，原子替换）、`results.jsonl`（每次估计一行，追加）、
-  `batches.log`（已计入批次号，幂等依据）、`buffer.npz`（滑动窗口
-  环形缓冲，二进制原子写）。所有写盘走临时文件 + fsync + rename。
+  最新结果+版本号+**航迹状态**，原子替换）、`results.jsonl`（每次估计
+  一行，追加）、`batches.log`（已计入批次号，幂等依据）、
+  `tracks.jsonl`（开启航迹时每次产生事件的版本一行）、`buffer.npz`
+  （滑动窗口环形缓冲，二进制原子写）。所有写盘走临时文件 + fsync +
+  rename。
 * **重启续写**：新进程按 id 懒加载会话，恢复累加器状态与已见批次号，
   历史结果不丢，版本号延续，可继续追加（见
   `test_persistence_survives_restart`、
@@ -219,6 +226,42 @@ python -m experiments.tracking_experiment --snr 15 --k-per-side 1200
 * **轮询/推送**：轮询只返回 `version > since_version` 的结果；
   SSE 先按 `after_version` 补发历史再实时推送，慢消费者只丢自己
   队列里最旧的待发结果，不阻塞追加路径。
+
+---
+
+## 6b. 角度航迹跟踪（建会话时 `tracking.enabled:true` 开启）
+
+开启后，会话每出一次估计就把这次的峰串成**带稳定编号**的航迹；不开的
+会话行为与旧版完全一致（估计响应不新增任何字段）。每次估计结果里每个
+角都注明归属（`tracking.angle_tracks`：`track_id` + `associated` +
+`reason`），或标 `unassigned`（暂无归属）/ `crossing`（交叉未决，
+本帧先不归属）。航迹状态：`tentative → confirmed`，确认后连续漏检
+3 次 `lost`、再漏到 6 次 `terminated`；暂态连续 2 次漏检即终止
+（一闪而过的假峰不会变成确认航迹）。
+
+* **普通关联**：匀速外推 + 全局最近邻 + 波门（暂态 5°、确认 10°），
+  唯一匹配；航迹对外输出**平滑角**（EMA 0.35，静态 50 快拍/20 dB 下
+  30 批最大误差 0.066°），原始 MUSIC 结果原样保留，**已推给上位机的
+  归属永不回改**（EMA 只作用于当前/未来点）。
+* **交叉（最难的点）**：两条确认航迹相向且外推位置 ≤8° 时进入
+  **运动趋势护航**——接近段只按各自速度外推（`coast` 点不计漏检、
+  峰不归属也不新生航迹，单峰/少报源/±28° 假峰都伤不到航迹）；两峰
+  分居交叉中心两侧、预测越过中心、中点平移消漂后残差合格时，按
+  **进入护航时冻结的运动方向**认回（与角度序/最近邻无关，编号不
+  互换），直到两峰分开 >11° 解除。固定种子下 60 个随机种子基交叉
+  零串号、零额外航迹。**为什么选它、放弃了纯最近邻/纯功率对号什么、
+  代价、以及在变速/三路交叉/固定强源等条件下会认错**，见
+  [`docs/航迹跟踪设计.md`](docs/航迹跟踪设计.md)。
+* **接口**：`GET …/tracks`（列全部）、`GET …/tracks/{id}`（历史点，
+  `measurement`/`coast` 分别标注）、`GET …/track-events?since_version=N`
+  （事件版本轮询，不漏不重）。
+* **落盘/重启/并发**：航迹全部状态随 `state.json` 原子落盘，事件进
+  `tracks.jsonl`；跟踪器是纯确定状态机（无时间戳/随机数），重启续写
+  与一口气跑完**逐项一致（时间戳除外）**；航迹更新在会话锁内与估计同
+  一个原子步，顺序等于估计实际处理顺序，同一估计的角不重不漏，重复
+  批次号不产生任何航迹事件。
+* 全部门限建会话时可在 `tracking` 下覆盖；升级前没有 `tracking` 配置的
+  老会话目录照常能读、能继续追加。
 
 ---
 
@@ -256,4 +299,11 @@ python -m experiments.tracking_experiment --snr 15 --k-per-side 1200
 | 轮询版本过滤 / SSE 历史补发与实时推送 | `test_append_estimate_poll_flow`、`test_sse_*` |
 | 合成同种子逐位一致 | `test_synthesis_bit_identical_same_seed`、`test_synthesis_endpoint_bit_identical_then_data_roundtrip` |
 | 细化比步长细一个数量级以上 | `test_refinement_finer_than_step_by_order_of_magnitude` |
+| 静止双目标恰好两条稳定航迹、编号不变、历史点 <0.1° | `tests/test_tracking.py::test_static_two_targets_two_stable_tracks` |
+| 中途进出：第三轨 created→confirmed→lost→terminated，前两条不受影响 | `test_target_enters_and_exits_lifecycle` |
+| 一闪而过不留确认航迹 | `test_single_batch_flash_leaves_no_confirmed_track` |
+| 交叉穿越编号跟随运动方向不互换 | `test_crossing_targets_keep_identities` |
+| 重启续写与一口气跑完逐项一致 / 重启后重复批次无事件 | `test_restart_matches_one_shot_run`、`test_restart_then_duplicate_batch_no_change` |
+| 并发等价实际顺序串行回放 / 重复批次无航迹事件 | `test_concurrent_appends_match_serial_replay` |
+| 未开航迹会话行为不变 | `test_tracking_disabled_session_unchanged` |
 | 各类人读错误与规模上限 | `test_error_*` / `test_http_*` |

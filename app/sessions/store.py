@@ -6,6 +6,7 @@
     state.json      累加器状态 + 最新版本号（原子写）
     results.jsonl   每次估计结果一行（追加写，重启不丢）
     batches.log     已计入的批次号，一行一个（幂等去重依据）
+    tracks.jsonl    开启航迹的会话：每次估计的航迹事件一行（版本号轮询）
 
 所有 JSON 写盘走“临时文件 + fsync + os.replace”原子替换/追加，
 避免崩溃时写出半截文件。JSONL/日志文件以追加模式打开并 fsync。
@@ -136,6 +137,23 @@ class SessionStore:
 
     def record_batch_ids(self, session_id: str, batch_ids: list[str]) -> None:
         self._append_lines(self.root / session_id / "batches.log", batch_ids)
+
+    # ------------------------------------------------------------------
+    def append_track_events(self, session_id: str, rows: list[dict]) -> None:
+        """追加航迹事件（每个估计版本写一行，随 results.jsonl 一起追加）。"""
+        self._append_jsonl(self.root / session_id / "tracks.jsonl", rows)
+
+    def load_track_events(self, session_id: str) -> list[dict]:
+        path = self.root / session_id / "tracks.jsonl"
+        if not path.exists():
+            return []
+        out = []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    out.append(json.loads(line))
+        return out
 
     # ------------------------------------------------------------------
     def save_buffer_npz(

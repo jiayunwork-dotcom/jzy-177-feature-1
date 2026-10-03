@@ -30,10 +30,25 @@ from ..errors import (
 from .accumulator import CovarianceAccumulator
 from .events import EventBroker
 from .store import SessionStore
+from .tracker import AngleTracker, Detection, Track, TrackEvent
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _tracking_config(config: dict) -> dict | None:
+    """从会话配置取航迹参数；未开启或老会话（无该字段）返回 None。
+
+    开启但未覆盖任何门限时返回空 dict（表示用跟踪模块默认参数），
+    与“未开启”的 None 区分开。
+    """
+    tc = config.get("tracking")
+    if not tc:
+        return None
+    if not tc.get("enabled", False):
+        return None
+    return {k: v for k, v in tc.items() if k != "enabled" and v is not None}
 
 
 class Session:
@@ -62,6 +77,13 @@ class Session:
         self._version = 0
         self._latest_result: dict | None = None
         self._loaded = False
+        # 航迹跟踪仅在会话显式开启时存在；不开的会话行为与旧版完全一致。
+        self._tracking_overrides = _tracking_config(config)
+        self._tracker: AngleTracker | None = (
+            AngleTracker(self._tracking_overrides)
+            if self._tracking_overrides is not None
+            else None
+        )
 
     # ------------------------------------------------------------------
     def _ensure_loaded(self) -> None:
@@ -79,6 +101,13 @@ class Session:
         self._seen_batches = self._store.load_batch_ids(self.id)
         self._version = int(state.get("version", 0))
         self._latest_result = state.get("latest_result")
+        if self._tracker is not None:
+            tracker_state = state.get("tracker")
+            if tracker_state is not None:
+                self._tracker = AngleTracker.from_state(tracker_state)
+            # 正常情况下 tracks.jsonl 是 state.json 的派生缓存；这里只做
+            # 防御性补齐（state 有、事件日志缺行不会发生，因为同锁内先写
+            # 日志再写 state）。
         self._loaded = True
 
     # ------------------------------------------------------------------
@@ -120,6 +149,7 @@ class Session:
                 if self._latest_result
                 else None,
                 "created_from": self.config.get("created_at"),
+                "tracking_enabled": self._tracker is not None,
             }
 
     # ------------------------------------------------------------------
@@ -183,33 +213,84 @@ class Session:
             "trigger_batch_id": trigger_batch_id,
             "result": result,
         }
+        track_events: list[TrackEvent] = []
+        if self._tracker is not None:
+            tracking = self._update_tracking(self._version, result)
+            track_events = tracking["events"]
+            # 信封要整体 JSON 落盘，事件换成普通 dict
+            tracking["events"] = [e.to_dict() for e in track_events]
+            envelope["tracking"] = tracking
         self._store.append_results(self.id, [envelope])
-        self._store.save_state(
-            self.id,
-            {
-                "version": self._version,
-                "latest_result": envelope,
-                "accumulator": self._acc.to_state(),
-            },
-        )
+        if track_events:
+            self._store.append_track_events(
+                self.id,
+                [{
+                    "version": self._version,
+                    "session_id": self.id,
+                    "created_at": envelope["created_at"],
+                    "events": [e.to_dict() for e in track_events],
+                }],
+            )
+        self._save_state()
         self._latest_result = envelope
         if self._broker is not None:
             self._broker.publish(self.id, envelope)
         return envelope
+
+    def _update_tracking(self, version: int, result: dict) -> dict:
+        """用本次 MUSIC 结果推进航迹，返回挂到估计信封上的 tracking 块。
+
+        角度取 ``result["angles"]``（已按角度升序），功率特征取对应细化
+        角上的 MUSIC 谱高（相对量，只在同一次估计内做对比，足够用于
+        护航判据与未来扩展）。归属结论与 angles 等长、一一对应。
+        """
+        assert self._tracker is not None
+        angles = list(result["angles"])
+        spectrum = result.get("spectrum_at_angles") or []
+        detections = [
+            Detection(
+                angle=float(a),
+                log_power=float(
+                    np.log(max(float(spectrum[i]), np.finfo(float).tiny))
+                ) if i < len(spectrum) else 0.0,
+                detection_index=i,
+            )
+            for i, a in enumerate(angles)
+        ]
+        upd = self._tracker.update(version, detections)
+        by_index = {a.detection_index: a for a in upd.assignments}
+        angle_tracks = [
+            {
+                "angle": angles[i],
+                "track_id": by_index[i].track_id,
+                "associated": by_index[i].associated,
+                "reason": by_index[i].reason,
+            }
+            for i in range(len(angles))
+        ]
+        return {
+            "version": version,
+            "angle_tracks": angle_tracks,
+            "events": upd.events,
+            "tracks": [t.to_dict() for t in self._tracker.list_tracks()],
+        }
+
+    def _save_state(self) -> None:
+        state = {
+            "version": self._version,
+            "latest_result": self._latest_result,
+            "accumulator": self._acc.to_state(),
+        }
+        if self._tracker is not None:
+            state["tracker"] = self._tracker.to_state()
+        self._store.save_state(self.id, state)
 
     def _persist_after_append(self, batch_id: str) -> None:
         self._store.record_batch_ids(self.id, [batch_id])
         packed = self._acc.pack_buffer()
         if packed is not None:
             self._store.save_buffer_npz(self.id, packed)
-        self._store.save_state(
-            self.id,
-            {
-                "version": self._version,
-                "latest_result": self._latest_result,
-                "accumulator": self._acc.to_state(),
-            },
-        )
+        self._save_state()
 
     # ------------------------------------------------------------------
     def results_since(self, version: int) -> list[dict]:
@@ -222,6 +303,55 @@ class Session:
         with self.lock:
             self._ensure_loaded()
             return self._latest_result
+
+    # ------------------------------------------------------------------
+    # 航迹查询（仅开启航迹的会话有内容）
+    # ------------------------------------------------------------------
+    @property
+    def tracking_enabled(self) -> bool:
+        return self._tracker is not None
+
+    def _require_tracking(self) -> AngleTracker:
+        if self._tracker is None:
+            raise ValidationError("该会话未开启航迹跟踪")
+        return self._tracker
+
+    def list_tracks(self, include_terminated: bool = True) -> list[dict]:
+        with self.lock:
+            self._ensure_loaded()
+            tracker = self._require_tracking()
+            return [self._track_payload(t) for t in
+                    tracker.list_tracks(include_terminated=include_terminated)]
+
+    def get_track_history(self, track_id: int) -> dict:
+        with self.lock:
+            self._ensure_loaded()
+            tracker = self._require_tracking()
+            track = tracker.get_track(int(track_id))
+            if track is None:
+                raise SessionNotFoundError(f"航迹不存在：{track_id}")
+            return self._track_payload(track, with_history=True)
+
+    def track_events_since(self, version: int) -> list[dict]:
+        """带版本号轮询航迹事件：只返回严格新于 ``version`` 的版本批次。
+
+        每个估计版本至多一行（行内是该次产生的若干事件，可能为空——
+        空事件版本不落盘），因此不漏、不重。
+        """
+        with self.lock:
+            self._ensure_loaded()
+            self._require_tracking()
+            rows = self._store.load_track_events(self.id)
+            return [r for r in rows if int(r["version"]) > int(version)]
+
+    def _track_payload(self, track: Track, *, with_history: bool = False) -> dict:
+        payload = track.to_dict()
+        if with_history:
+            payload["history"] = [
+                {"version": pt.version, "angle": pt.angle, "kind": pt.kind}
+                for pt in track.history
+            ]
+        return payload
 
 
 class SessionManager:
@@ -287,6 +417,28 @@ class SessionManager:
                 raise ValidationError("forgetting_factor 必须满足 0 < lambda <= 1")
             upd["forgetting_factor"] = ff
         config["update"] = upd
+        tracking = config.get("tracking")
+        if tracking is not None:
+            tracking = dict(tracking)
+            enabled = bool(tracking.get("enabled", False))
+            tracking["enabled"] = enabled
+            int_fields = (
+                "confirm_hits", "tentative_max_misses", "lost_after_misses",
+                "terminate_after_misses", "convoy_max_age", "grace_scans",
+            )
+            float_fields = (
+                "tentative_gate_deg", "confirm_gate_deg", "position_alpha",
+                "convoy_enter_deg",
+                "convoy_region_deg", "convoy_margin_deg", "convoy_wide_deg",
+                "convoy_release_deg",
+            )
+            for name in int_fields:
+                if tracking.get(name) is not None:
+                    tracking[name] = int(tracking[name])
+            for name in float_fields:
+                if tracking.get(name) is not None:
+                    tracking[name] = float(tracking[name])
+            config["tracking"] = tracking
         return config
 
     def create_session(self, config: dict, session_id: str | None = None) -> Session:

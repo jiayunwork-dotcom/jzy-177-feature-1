@@ -31,10 +31,35 @@ class UpdateConfigModel(BaseModel):
     forgetting_factor: float | None = Field(None, gt=0.0, le=1.0)
 
 
+class TrackingConfigModel(BaseModel):
+    """航迹跟踪开关与可选门限覆盖（默认不开）。
+
+    仅 ``enabled`` 为 true 的会话才会在每次估计后维护航迹；门限值缺省
+    采用跟踪模块内置的标定默认值，一般无需指定。
+    """
+
+    enabled: bool = False
+    tentative_gate_deg: float | None = Field(None, gt=0)
+    confirm_gate_deg: float | None = Field(None, gt=0)
+    confirm_hits: int | None = Field(None, ge=1)
+    tentative_max_misses: int | None = Field(None, ge=1)
+    lost_after_misses: int | None = Field(None, ge=1)
+    terminate_after_misses: int | None = Field(None, ge=1)
+    position_alpha: float | None = Field(None, gt=0.0, le=1.0)
+    convoy_enter_deg: float | None = Field(None, gt=0)
+    convoy_region_deg: float | None = Field(None, gt=0)
+    convoy_margin_deg: float | None = Field(None, gt=0)
+    convoy_wide_deg: float | None = Field(None, gt=0)
+    convoy_release_deg: float | None = Field(None, gt=0)
+    convoy_max_age: int | None = Field(None, ge=1)
+    grace_scans: int | None = Field(None, ge=0)
+
+
 class CreateSessionModel(BaseModel):
     array: ArrayConfigModel
     estimation: EstimationConfigModel | None = None
     update: UpdateConfigModel | None = None
+    tracking: TrackingConfigModel | None = None
 
 
 class AppendModel(BaseModel):
