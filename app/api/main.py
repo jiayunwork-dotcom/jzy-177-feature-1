@@ -152,6 +152,34 @@ def latest_result(session_id: str):
     return {"session_id": session_id, "result": result}
 
 
+# ----------------------------------------------------------------------
+# 航迹
+# ----------------------------------------------------------------------
+@app.get("/sessions/{session_id}/tracks")
+def list_tracks(session_id: str, include_terminated: bool = True):
+    """列出会话的全部航迹（默认含已终止）。"""
+    return manager.get(session_id).tracks_overview(include_terminated)
+
+
+@app.get("/sessions/{session_id}/tracks/{track_id}")
+def get_track(session_id: str, track_id: int):
+    """取单条航迹：状态 + 一路走过的历史点（version/角度/功率）。"""
+    return manager.get(session_id).track_detail(track_id)
+
+
+@app.get("/sessions/{session_id}/track-events")
+def poll_track_events(session_id: str, since_version: int = 0):
+    """航迹状态变化按版本号轮询：只返回严格新于 ``since_version`` 的事件。"""
+    session = manager.get(session_id)
+    events = session.track_events_since(since_version)
+    return {
+        "session_id": session_id,
+        "since_version": since_version,
+        "latest_version": session.status()["version"],
+        "events": events,
+    }
+
+
 @app.get("/sessions/{session_id}/stream")
 async def stream_results(session_id: str, after_version: int = 0,
                          max_idle_seconds: float = 0.0):

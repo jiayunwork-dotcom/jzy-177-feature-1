@@ -1,11 +1,12 @@
-"""会话持久化存储：配置、增量状态、结果、批次号全部落盘。
+"""会话持久化存储：配置、增量状态、结果、批次号、航迹全部落盘。
 
 目录布局（``DATA_DIR/<session_id>/``）：
 
-    config.json     阵列参数与估计配置（创建后只读）
-    state.json      累加器状态 + 最新版本号（原子写）
-    results.jsonl   每次估计结果一行（追加写，重启不丢）
-    batches.log     已计入的批次号，一行一个（幂等去重依据）
+    config.json       阵列参数与估计配置（创建后只读）
+    state.json        累加器状态 + 最新版本号 + 航迹关联器状态（原子写）
+    results.jsonl     每次估计结果一行（追加写，重启不丢）
+    batches.log       已计入的批次号，一行一个（幂等去重依据）
+    track_events.jsonl 航迹状态变化事件，一行一个（版本号轮询依据）
 
 所有 JSON 写盘走“临时文件 + fsync + os.replace”原子替换/追加，
 避免崩溃时写出半截文件。JSONL/日志文件以追加模式打开并 fsync。
@@ -90,6 +91,10 @@ class SessionStore:
                 )
                 (sdir / "results.jsonl").touch()
                 (sdir / "batches.log").touch()
+                # 未开航迹的会话目录与升级前完全一致；航迹事件文件在首次
+                # 产生事件时由追加写自动创建（升级前目录同样可读）。
+                if bool((config.get("tracking") or {}).get("enabled")):
+                    (sdir / "track_events.jsonl").touch()
             except BaseException:
                 # 创建失败不残留半成品目录
                 for p in sorted(sdir.glob("**/*"), reverse=True):
@@ -136,6 +141,23 @@ class SessionStore:
 
     def record_batch_ids(self, session_id: str, batch_ids: list[str]) -> None:
         self._append_lines(self.root / session_id / "batches.log", batch_ids)
+
+    # ------------------------------------------------------------------
+    def append_track_events(self, session_id: str, rows: list[dict]) -> None:
+        # 升级前创建的会话目录没有该文件；append 模式打开即自动创建。
+        self._append_jsonl(self.root / session_id / "track_events.jsonl", rows)
+
+    def load_track_events(self, session_id: str) -> list[dict]:
+        path = self.root / session_id / "track_events.jsonl"
+        if not path.exists():
+            return []
+        out = []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    out.append(json.loads(line))
+        return out
 
     # ------------------------------------------------------------------
     def save_buffer_npz(

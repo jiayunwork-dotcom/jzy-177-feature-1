@@ -31,10 +31,17 @@ class UpdateConfigModel(BaseModel):
     forgetting_factor: float | None = Field(None, gt=0.0, le=1.0)
 
 
+class TrackingConfigModel(BaseModel):
+    enabled: bool = Field(
+        False, description="是否在会话上挂航迹：每次估计自动关联并维护航迹"
+    )
+
+
 class CreateSessionModel(BaseModel):
     array: ArrayConfigModel
     estimation: EstimationConfigModel | None = None
     update: UpdateConfigModel | None = None
+    tracking: TrackingConfigModel | None = None
 
 
 class AppendModel(BaseModel):

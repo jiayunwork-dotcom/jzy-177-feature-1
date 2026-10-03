@@ -48,6 +48,12 @@ class SessionNotFoundError(DOAError):
     type = "session_not_found"
 
 
+class TrackNotFoundError(DOAError):
+    """航迹不存在。"""
+
+    type = "track_not_found"
+
+
 class VersionConflictError(DOAError):
     """批次号回退等会话状态冲突。"""
 

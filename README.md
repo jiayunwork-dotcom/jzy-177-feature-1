@@ -4,6 +4,9 @@
 上位机按批流式推送复基带快拍，服务增量维护协方差、估计信源数
 （MDL/AIC）、做空间平滑与 MUSIC 谱扫描细化、逐角给出单源白噪声
 确定性模型 CRB，并支持会话持久化、版本轮询与 SSE 订阅推送。
+会话可选挂**来波方向航迹**：稳定编号、历史点、出现/确认/丢失/终止
+事件，交叉（谱峰合并、MDL 少报）期间不判丢、不并轨、编号随运动
+方向续接。
 
 测向内核（协方差、增量更新、源数判定、空间平滑、谱扫描与细化、
 CRB、数据合成）全部用 NumPy 自行实现，未使用任何现成测向工具包。
@@ -23,14 +26,17 @@ app/
     smoothing.py            # 前后向空间平滑、子阵长度校验（可分辨上限）
     criteria.py             # MDL / AIC（Wax-Kailath 形式）
     music.py                # 噪声子空间、空间谱、找峰、黄金分割细化
+    beamform.py             # 常规波束逐角功率（航迹关联的功率线索）
     crb.py                  # 单源白噪声确定性模型 CRB
     synthesis.py            # 合成数据（PCG64，同种子逐位一致）
     engine.py               # 总装 + 全部输入校验 + 规模上限
+  tracker/                  # —— 航迹关联（不依赖会话存储与 HTTP）——
+    tracker.py              # 预测+最近邻+交叉保持、候选/确认/丢失/终止
   sessions/                 # —— 会话存储与增量状态 ——
     accumulator.py          # 滑动窗口 / 指数遗忘 增量协方差 + 批处理参考定义
-    store.py                # 原子落盘（config/state/results.jsonl/batches/buffer.npz）
+    store.py                # 原子落盘（config/state/results.jsonl/batches/track_events/buffer.npz）
     events.py               # 内存发布订阅（SSE 推送总线）
-    session.py              # 会话：并发锁、批次幂等、追加/估计/持久化/重启续写
+    session.py              # 会话：并发锁、批次幂等、追加/估计/航迹/持久化/重启续写
   api/
     schemas.py              # Pydantic 请求/响应模型
     main.py                 # FastAPI：路由、SSE、错误处理、合成端点
@@ -69,13 +75,15 @@ pytest
 
 | 方法 路径 | 说明 |
 | --- | --- |
-| `POST /sessions` | 建会话：阵列参数 + 估计配置 + 增量更新方式 |
-| `GET  /sessions` / `GET /sessions/{id}` | 列表 / 状态（版本、活跃快拍数、已收批次数） |
+| `POST /sessions` | 建会话：阵列参数 + 估计配置 + 增量更新方式 + 可选 `tracking.enabled` 航迹开关 |
+| `GET  /sessions` / `GET /sessions/{id}` | 列表 / 状态（版本、活跃快拍数、已收批次数、`tracking_enabled`、`n_tracks`） |
 | `POST /sessions/{id}/append` | 追加一批（实部/虚部分开），带 `batch_id` 幂等；可 `estimate:true` 追加后立即估计 |
 | `POST /sessions/{id}/estimate` | 用当前累计协方差出一次估计（可临时覆盖角度范围/步长/平滑/源数/真值角） |
 | `GET  /sessions/{id}/results?since_version=N` | **带版本号轮询**：只返回严格新于 N 的结果 |
 | `GET  /sessions/{id}/results/latest` | 最新一条 |
 | `GET  /sessions/{id}/stream?after_version=N` | **SSE 订阅推送**：先补发历史，再推新结果 |
+| `GET  /sessions/{id}/tracks` / `.../tracks/{tid}` | 列出会话全部航迹 / 取单条航迹（含历史点） |
+| `GET  /sessions/{id}/track-events?since_version=N` | **航迹状态变化按版本号轮询**（出现/确认/丢失/重获/终止/交叉） |
 | `POST /synthesis` | 闭环自测：给各源方位/功率、SNR、快拍数、种子，造数据（可选立即估计/回传数据） |
 
 ### 典型流程
@@ -202,10 +210,13 @@ python -m experiments.tracking_experiment --snr 15 --k-per-side 1200
 ## 6. 会话、持久化与并发
 
 * **持久化布局**（`DOA_DATA_DIR/<session_id>/`）：
-  `config.json`（配置，创建后只读）、`state.json`（累加器元数据+
-  最新结果+版本号，原子替换）、`results.jsonl`（每次估计一行，追加）、
-  `batches.log`（已计入批次号，幂等依据）、`buffer.npz`（滑动窗口
-  环形缓冲，二进制原子写）。所有写盘走临时文件 + fsync + rename。
+  `config.json`（配置，创建后只读）、`state.json`（累加器状态 +
+  最新结果信封骨架 + 版本号，开航迹时含航迹关联器完整状态，原子替换；
+  完整最新信封以 `results.jsonl` 为准重启恢复）、
+  `results.jsonl`（每次估计一行完整信封，追加）、`batches.log`（已计入
+  批次号，幂等依据）、`track_events.jsonl`（航迹事件，仅开航迹的会话）、
+  `buffer.npz`（滑动窗口环形缓冲，二进制原子写）。所有写盘走临时
+  文件 + fsync + rename。
 * **重启续写**：新进程按 id 懒加载会话，恢复累加器状态与已见批次号，
   历史结果不丢，版本号延续，可继续追加（见
   `test_persistence_survives_restart`、
@@ -219,6 +230,38 @@ python -m experiments.tracking_experiment --snr 15 --k-per-side 1200
 * **轮询/推送**：轮询只返回 `version > since_version` 的结果；
   SSE 先按 `after_version` 补发历史再实时推送，慢消费者只丢自己
   队列里最旧的待发结果，不阻塞追加路径。
+
+---
+
+## 6a. 来波方向航迹（`tracking.enabled`）
+
+建会话时给 `"tracking": {"enabled": true}` 即在会话上挂航迹：
+会话**每出一次估计**（append 触发或手动 estimate 都算），就用本次的
+角度更新航迹。不开航迹的会话行为与旧版完全一致（不产生新字段、
+不建新文件）。完整设计取舍见 [`docs/tracking_design.md`](docs/tracking_design.md)。
+
+* **稳定编号与生命周期**：候选 `tentative`（连续 3 拍命中才确认，
+  一闪而过的假峰永不确认）→ `confirmed`；连续 3 拍未见 → `lost`，
+  再 3 拍仍未见（共 6 拍）→ `terminated`；丢失后重新命中发
+  `track_reacquired` 并恢复确认。航迹编号只增不复用。
+* **每次估计结果**信封新增 `tracking.assignments`：逐角度注明
+  `track_id` 与 `associated`（交叉附近暂时没有归属即为 false）；
+  另有 `tracks`（快照）、`events`、`crossing`。**只记录真实归属的
+  测量，归属一经推给上位机不回头改。**
+* **交叉**：两目标靠近到预测间距 ≤2.5°（或靠近且 MDL/谱峰已少报）
+  时自动成组保持——组内航迹不计丢失、不并轨，组邻域内的测量（含
+  ±28° 的 MUSIC 旁瓣假峰）不归属也不生新航迹；待两峰重新分开且
+  按各自速度外推的归属有 1° 防互换裕量时才解组，编号沿运动方向
+  续接。长解不开有 12 拍兜底。
+* **持久化与并发**：航迹状态随 `state.json` 原子落盘、事件追加
+  `track_events.jsonl`；关联是确定性的，**中途重启后接着推的航迹
+  （编号、历史点、每次状态变化）与一口气跑完逐项一致，时间戳除外**。
+  更新在会话锁内串行，顺序与估计实际处理顺序一致；重复批次号
+  不产生任何航迹事件。
+* **查询**：`GET /sessions/{id}/tracks` 列全部航迹、
+  `GET /sessions/{id}/tracks/{tid}` 取单条历史、
+  `GET /sessions/{id}/track-events?since_version=N` 版本号轮询
+  （不漏不重）。SSE 推送的结果信封自带 `tracking` 字段。
 
 ---
 
@@ -256,4 +299,11 @@ python -m experiments.tracking_experiment --snr 15 --k-per-side 1200
 | 轮询版本过滤 / SSE 历史补发与实时推送 | `test_append_estimate_poll_flow`、`test_sse_*` |
 | 合成同种子逐位一致 | `test_synthesis_bit_identical_same_seed`、`test_synthesis_endpoint_bit_identical_then_data_roundtrip` |
 | 细化比步长细一个数量级以上 | `test_refinement_finer_than_step_by_order_of_magnitude` |
+| 静止双目标恰好两条确认航迹、编号不变、逐点 <0.1° | `test_tracking.py::test_stationary_two_targets_two_stable_tracks` |
+| 中途进出：出现→确认→丢失→终止，前两条不受影响 | `test_tracking.py::test_appears_midway_then_disappears_lifecycle` |
+| 一闪而过不留确认航迹 | `test_tracking.py::test_single_batch_blip_leaves_no_confirmed_track` |
+| 交叉不判丢不并轨、编号随运动方向走 | `test_tracking.py::test_crossing_targets_keep_identity` |
+| 重启（含交叉正中间）与一口气跑完逐项一致 | `test_tracking.py::test_restart_*` |
+| 并发等价按实际顺序串行重放、重复批次无航迹事件 | `test_tracking.py::test_concurrent_appends_tracks_match_serial_replay` |
+| 航迹事件版本轮询不漏不重 / 旧目录兼容 | `test_track_events_polling_no_loss_no_duplicate`、`test_legacy_session_without_tracking_key_loads` |
 | 各类人读错误与规模上限 | `test_error_*` / `test_http_*` |

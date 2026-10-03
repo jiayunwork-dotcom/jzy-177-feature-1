@@ -22,14 +22,17 @@ from ..doa.engine import (
     estimate,
     validate_array_inputs,
 )
+from ..doa.beamform import beamscan_powers
 from ..errors import (
     LimitExceededError,
     SessionNotFoundError,
+    TrackNotFoundError,
     ValidationError,
 )
 from .accumulator import CovarianceAccumulator
 from .events import EventBroker
 from .store import SessionStore
+from ..tracker import Tracker
 
 
 def _utc_now() -> str:
@@ -58,6 +61,9 @@ class Session:
             window_size=upd.get("window_size", 500),
             forgetting_factor=upd.get("forgetting_factor"),
         )
+        trk = config.get("tracking") or {}
+        self._tracking_enabled = bool(trk.get("enabled", False))
+        self._tracker = Tracker(enabled=self._tracking_enabled)
         self._seen_batches: set[str] = set()
         self._version = 0
         self._latest_result: dict | None = None
@@ -79,6 +85,17 @@ class Session:
         self._seen_batches = self._store.load_batch_ids(self.id)
         self._version = int(state.get("version", 0))
         self._latest_result = state.get("latest_result")
+        if self._latest_result is None and state.get("latest_result_ref"):
+            # 新版 state 只存信封骨架，完整信封以 results.jsonl 为准
+            rows = self._store.load_results(self.id)
+            ref_v = state["latest_result_ref"]["version"]
+            for row in reversed(rows):
+                if row["version"] == ref_v:
+                    self._latest_result = row
+                    break
+        tracker_state = state.get("tracker")
+        if tracker_state is not None:
+            self._tracker.load_state(tracker_state)
         self._loaded = True
 
     # ------------------------------------------------------------------
@@ -120,6 +137,10 @@ class Session:
                 if self._latest_result
                 else None,
                 "created_from": self.config.get("created_at"),
+                "tracking_enabled": self._tracking_enabled,
+                "n_tracks": len(self._tracker.list_tracks())
+                if self._tracking_enabled
+                else 0,
             }
 
     # ------------------------------------------------------------------
@@ -183,33 +204,59 @@ class Session:
             "trigger_batch_id": trigger_batch_id,
             "result": result,
         }
+        if self._tracking_enabled:
+            envelope["tracking"] = self._update_tracks(self._version, result)
         self._store.append_results(self.id, [envelope])
-        self._store.save_state(
-            self.id,
-            {
-                "version": self._version,
-                "latest_result": envelope,
-                "accumulator": self._acc.to_state(),
-            },
-        )
+        self._save_state()
         self._latest_result = envelope
         if self._broker is not None:
             self._broker.publish(self.id, envelope)
         return envelope
+
+    def _update_tracks(self, version: int, result: dict) -> dict:
+        """用本次估计的角度推进航迹；事件补时间戳后追加落盘。"""
+        powers = beamscan_powers(
+            result["angles"],
+            self._acc.covariance(),
+            self._spec.positions(),
+            self._spec.wavelength,
+        )
+        tracking = self._tracker.update(version, result["angles"], powers)
+        events = tracking["events"]
+        for ev in events:
+            ev["created_at"] = _utc_now()
+        if events:
+            self._store.append_track_events(self.id, events)
+        return tracking
+
+    def _save_state(self) -> None:
+        # state.json 里的 latest_result 只存信封骨架（结果体可能很大：
+        # MUSIC 谱、准则曲线；航迹快照也只留当前状态）。重启加载时用
+        # results.jsonl 最后一行恢复完整信封，历史逐拍信封永不回改。
+        latest = self._latest_result
+        latest_for_state = None
+        if latest is not None:
+            latest_for_state = {
+                "version": latest["version"],
+                "session_id": latest["session_id"],
+                "created_at": latest.get("created_at"),
+                "trigger_batch_id": latest.get("trigger_batch_id"),
+            }
+        state = {
+            "version": self._version,
+            "latest_result_ref": latest_for_state,
+            "accumulator": self._acc.to_state(),
+        }
+        if self._tracking_enabled:
+            state["tracker"] = self._tracker.to_state()
+        self._store.save_state(self.id, state)
 
     def _persist_after_append(self, batch_id: str) -> None:
         self._store.record_batch_ids(self.id, [batch_id])
         packed = self._acc.pack_buffer()
         if packed is not None:
             self._store.save_buffer_npz(self.id, packed)
-        self._store.save_state(
-            self.id,
-            {
-                "version": self._version,
-                "latest_result": self._latest_result,
-                "accumulator": self._acc.to_state(),
-            },
-        )
+        self._save_state()
 
     # ------------------------------------------------------------------
     def results_since(self, version: int) -> list[dict]:
@@ -222,6 +269,54 @@ class Session:
         with self.lock:
             self._ensure_loaded()
             return self._latest_result
+
+    # ------------------------------------------------------------------
+    # 航迹查询
+    # ------------------------------------------------------------------
+    def _tracks_or_404(self) -> Tracker:
+        if not self._tracking_enabled:
+            raise ValidationError(
+                "该会话创建时未开启航迹（tracking.enabled=false），"
+                "没有航迹可查"
+            )
+        return self._tracker
+
+    def tracks_overview(self, include_terminated: bool = True) -> dict:
+        with self.lock:
+            self._ensure_loaded()
+            tracker = self._tracks_or_404()
+            return {
+                "session_id": self.id,
+                "tracks": [
+                    t.snapshot()
+                    for t in tracker.list_tracks(
+                        include_terminated=include_terminated
+                    )
+                ],
+            }
+
+    def track_detail(self, track_id: int) -> dict:
+        with self.lock:
+            self._ensure_loaded()
+            tracker = self._tracks_or_404()
+            try:
+                track = tracker.get_track(int(track_id))
+            except KeyError:
+                raise TrackNotFoundError(
+                    f"航迹 {track_id} 不存在",
+                    details={"track_id": int(track_id)},
+                )
+            snap = track.snapshot()
+            snap["session_id"] = self.id
+            snap["history"] = track.history
+            return snap
+
+    def track_events_since(self, version: int) -> list[dict]:
+        with self.lock:
+            self._ensure_loaded()
+            self._tracks_or_404()
+            rows = self._store.load_track_events(self.id)
+            return [e for e in rows if int(e["version"]) > int(version)]
 
 
 class SessionManager:
@@ -287,6 +382,10 @@ class SessionManager:
                 raise ValidationError("forgetting_factor 必须满足 0 < lambda <= 1")
             upd["forgetting_factor"] = ff
         config["update"] = upd
+        trk = config.get("tracking") or {}
+        if not isinstance(trk, dict):
+            raise ValidationError("tracking 必须是对象，含布尔字段 enabled")
+        config["tracking"] = {"enabled": bool(trk.get("enabled", False))}
         return config
 
     def create_session(self, config: dict, session_id: str | None = None) -> Session:
